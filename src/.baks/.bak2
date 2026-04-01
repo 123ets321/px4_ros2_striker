@@ -1,0 +1,588 @@
+/**
+ * @file apn_fw_striker_node.cpp
+ * @brief Fixed-Wing APN Guidance Striker — ROS2 Offboard Node
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  Translated directly from FixedwingPositionControl::control_strike() firmware
+ *  logic into ROS2 offboard attitude setpoint control.
+ *
+ *  Control layer: ATTITUDE setpoint  (ocm.attitude = true)
+ *  Unlike multicopter which commands velocity/acceleration, fixed-wing guidance
+ *  must resolve the NED acceleration command into roll/pitch/thrust angles
+ *  because the lift vector — not direct thrust — provides lateral/vertical force.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  GUIDANCE LAW  (identical to firmware reference)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ *  R       = p_target − p_drone                   LOS vector [NED, m]
+ *  V_rel   = v_target − v_drone                   relative velocity [NED, m/s]
+ *  λ̂       = R / |R|                              LOS unit vector
+ *  Vc      = −(V_rel · λ̂)                         closing speed (+ve = closing)
+ *  Ω       = (R × V_rel) / |R|²                   LOS angular rate [rad/s]
+ *
+ *  a_PN    = N · |Vc| · (λ̂ × Ω)                  Pure PN term [NED, m/s²]
+ *  a_aug   = (N/2) · [a_tgt − (a_tgt·λ̂)λ̂]        Augmented term (target maneuver)
+ *  a_cmd   = a_PN + a_aug                          [saturated to 2g]
+ *
+ *  NED → Body projection:
+ *      a_body  = R_body_from_ned · a_cmd           via attitude quaternion
+ *
+ *  Attitude inversion:
+ *      roll    = atan2(a_body_y,  g_eff)           g_eff = g − a_body_z
+ *      pitch   = −atan2(a_body_z, V_true)          uses real airspeed
+ *      yaw     = atan2(R_E, R_N)                   point nose at target
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  Topics
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  SUB  /strike_point                           sensor_msgs/NavSatFix
+ *  SUB  /fmu/out/vehicle_local_position         px4_msgs/VehicleLocalPosition
+ *  SUB  /fmu/out/vehicle_status                 px4_msgs/VehicleStatus
+ *  SUB  /fmu/out/vehicle_attitude               px4_msgs/VehicleAttitude
+ *  SUB  /fmu/out/airspeed_validated             px4_msgs/AirspeedValidated
+ *  PUB  /fmu/in/offboard_control_mode           px4_msgs/OffboardControlMode
+ *  PUB  /fmu/in/vehicle_attitude_setpoint       px4_msgs/VehicleAttitudeSetpoint
+ *  PUB  /fmu/in/vehicle_command                 px4_msgs/VehicleCommand
+ */
+
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <px4_msgs/msg/vehicle_local_position.hpp>
+#include <px4_msgs/msg/vehicle_status.hpp>
+#include <px4_msgs/msg/vehicle_attitude.hpp>
+#include <px4_msgs/msg/airspeed_validated.hpp>
+#include <px4_msgs/msg/offboard_control_mode.hpp>
+#include <px4_msgs/msg/vehicle_attitude_setpoint.hpp>
+#include <px4_msgs/msg/vehicle_command.hpp>
+#include <px4_msgs/msg/vehicle_command_ack.hpp>
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+#include <cmath>
+
+using namespace std::chrono_literals;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Tuning Constants  — mirror of firmware FixedwingAPN_strike.cpp
+// ═══════════════════════════════════════════════════════════════════════════
+
+static constexpr double APN_N             = 4.5;               // Navigation constant
+static constexpr double MAX_ROLL_RAD      = 55.0 * M_PI / 180.0;  // Hard bank limit
+static constexpr double MAX_PITCH_RAD     = 40.0 * M_PI / 180.0;  // Hard pitch limit
+static constexpr double APN_THRUST        = 1.0;               // Full throttle on strike
+static constexpr double HIT_RADIUS        = 5.0;               // Proximity fuse [m]
+static constexpr double MAX_LAT_ACCEL     = 2.0 * 9.81;        // 2g lateral saturation
+static constexpr double AIRSPEED_MIN      = 5.0;               // Fallback airspeed guard [m/s]
+static constexpr double AIRSPEED_FALLBACK = 15.0;              // Fallback if sensor bad [m/s]
+static constexpr double G                 = 9.81;              // Gravity [m/s²]
+static constexpr double G_DENOM_MIN       = 0.5;               // Guard for roll division
+static constexpr double DT                = 0.02;              // Loop period [s]
+static constexpr double R_EARTH           = 6371000.0;         // Earth radius [m]
+
+// IIR LPF — target state estimator (matches firmware values)
+static constexpr double ALPHA_TGT_VEL    = 0.25;
+static constexpr double ALPHA_TGT_ACCEL  = 0.15;
+
+// Offboard priming
+static constexpr int    PRIME_COUNT      = 50;
+static constexpr int    RETRY_INTERVAL   = 25;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+inline Eigen::Vector3d lpf3(double alpha,
+                            const Eigen::Vector3d& x,
+                            const Eigen::Vector3d& x_prev)
+{
+    return alpha * x + (1.0 - alpha) * x_prev;
+}
+
+// Quaternion (w,x,y,z) → 3×3 rotation matrix (body ← NED)
+inline Eigen::Matrix3d quat_to_dcm(double w, double x, double y, double z)
+{
+    Eigen::Quaterniond q(w, x, y, z);
+    q.normalize();
+    return q.toRotationMatrix();   // R_ned_from_body; transpose → body_from_ned
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  APNFixedWingStrikerNode
+// ═══════════════════════════════════════════════════════════════════════════
+class APNFixedWingStrikerNode : public rclcpp::Node
+{
+public:
+    APNFixedWingStrikerNode()
+    : Node("apn_fw_striker_node"),
+      has_ref_(false), has_target_(false), target_initialized_(false),
+      nav_state_(0), setpoint_counter_(0),
+      airspeed_(AIRSPEED_FALLBACK),
+      drone_pos_ned_(Eigen::Vector3d::Zero()),
+      drone_vel_ned_(Eigen::Vector3d::Zero()),
+      att_q_(1.0, 0.0, 0.0, 0.0),            // identity quaternion [w,x,y,z]
+      target_pos_ned_(Eigen::Vector3d::Zero()),
+      target_vel_ned_(Eigen::Vector3d::Zero()),
+      target_accel_ned_(Eigen::Vector3d::Zero()),
+      target_pos_prev_(Eigen::Vector3d::Zero()),
+      target_vel_prev_(Eigen::Vector3d::Zero())
+    {
+        // ── QoS profiles ───────────────────────────────────────────────────
+        auto sensor_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+                            .best_effort()
+                            .durability_volatile();
+
+        auto status_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+                            .reliable()
+                            .transient_local();
+
+        // ── Subscriptions ──────────────────────────────────────────────────
+        target_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
+            "/strike_point", 10,
+            std::bind(&APNFixedWingStrikerNode::target_cb, this, std::placeholders::_1));
+
+        local_pos_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>(
+            "/fmu/out/vehicle_local_position", sensor_qos,
+            std::bind(&APNFixedWingStrikerNode::local_pos_cb, this, std::placeholders::_1));
+
+        status_sub_ = this->create_subscription<px4_msgs::msg::VehicleStatus>(
+            "/fmu/out/vehicle_status_v1", sensor_qos,
+            std::bind(&APNFixedWingStrikerNode::status_cb, this, std::placeholders::_1));
+
+        attitude_sub_ = this->create_subscription<px4_msgs::msg::VehicleAttitude>(
+            "/fmu/out/vehicle_attitude", sensor_qos,
+            std::bind(&APNFixedWingStrikerNode::attitude_cb, this, std::placeholders::_1));
+
+        airspeed_sub_ = this->create_subscription<px4_msgs::msg::AirspeedValidated>(
+            "/fmu/out/airspeed_validated", sensor_qos,
+            std::bind(&APNFixedWingStrikerNode::airspeed_cb, this, std::placeholders::_1));
+
+        ack_sub_ = this->create_subscription<px4_msgs::msg::VehicleCommandAck>(
+            "/fmu/out/vehicle_command_ack", sensor_qos,
+            std::bind(&APNFixedWingStrikerNode::ack_cb, this, std::placeholders::_1));
+
+        // ── Publishers ─────────────────────────────────────────────────────
+        cmd_pub_  = this->create_publisher<px4_msgs::msg::VehicleCommand>(
+            "/fmu/in/vehicle_command", sensor_qos);
+        ocm_pub_  = this->create_publisher<px4_msgs::msg::OffboardControlMode>(
+            "/fmu/in/offboard_control_mode", sensor_qos);
+        att_sp_pub_ = this->create_publisher<px4_msgs::msg::VehicleAttitudeSetpoint>(
+            "/fmu/in/vehicle_attitude_setpoint", sensor_qos);
+
+        // ── 50 Hz timer ────────────────────────────────────────────────────
+        timer_ = this->create_wall_timer(
+            20ms, std::bind(&APNFixedWingStrikerNode::timer_cb, this));
+
+        RCLCPP_INFO(this->get_logger(),
+            "[APN-FW] Node initialised. Awaiting GPS origin and strike point...");
+    }
+
+private:
+    // ── ROS handles ──────────────────────────────────────────────────────────
+    rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr          target_sub_;
+    rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr  local_pos_sub_;
+    rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr         status_sub_;
+    rclcpp::Subscription<px4_msgs::msg::VehicleAttitude>::SharedPtr       attitude_sub_;
+    rclcpp::Subscription<px4_msgs::msg::AirspeedValidated>::SharedPtr     airspeed_sub_;
+    rclcpp::Subscription<px4_msgs::msg::VehicleCommandAck>::SharedPtr     ack_sub_;
+
+    rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr           cmd_pub_;
+    rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr      ocm_pub_;
+    rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr  att_sp_pub_;
+
+    rclcpp::TimerBase::SharedPtr timer_;
+
+    // ── State ─────────────────────────────────────────────────────────────────
+    bool    has_ref_, has_target_, target_initialized_;
+    uint8_t nav_state_;
+    int     setpoint_counter_;
+    double  airspeed_;                    // True airspeed [m/s]
+
+    double ref_lat_, ref_lon_;
+    float  ref_alt_;
+
+    Eigen::Vector3d    drone_pos_ned_;
+    Eigen::Vector3d    drone_vel_ned_;
+    Eigen::Vector4d    att_q_;            // [w, x, y, z]
+
+    Eigen::Vector3d    target_pos_ned_;
+    Eigen::Vector3d    target_vel_ned_;   // LPF-filtered target velocity
+    Eigen::Vector3d    target_accel_ned_; // LPF-filtered target acceleration
+    Eigen::Vector3d    target_pos_prev_;
+    Eigen::Vector3d    target_vel_prev_;
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  GPS → NED conversion
+    // ═════════════════════════════════════════════════════════════════════════
+    Eigen::Vector3d gps_to_ned(double lat_deg, double lon_deg, double alt_m) const
+    {
+        const double lat_r     = lat_deg  * M_PI / 180.0;
+        const double lon_r     = lon_deg  * M_PI / 180.0;
+        const double ref_lat_r = ref_lat_ * M_PI / 180.0;
+        const double ref_lon_r = ref_lon_ * M_PI / 180.0;
+
+        Eigen::Vector3d ned;
+        ned.x() =  R_EARTH * (lat_r - ref_lat_r);
+        ned.y() =  R_EARTH * std::cos(ref_lat_r) * (lon_r - ref_lon_r);
+        ned.z() = -(alt_m - static_cast<double>(ref_alt_));
+        return ned;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Callbacks
+    // ═════════════════════════════════════════════════════════════════════════
+    void status_cb(const px4_msgs::msg::VehicleStatus::SharedPtr msg)
+    {
+        nav_state_ = msg->nav_state;
+    }
+
+    void attitude_cb(const px4_msgs::msg::VehicleAttitude::SharedPtr msg)
+    {
+        // PX4 quaternion convention: [w, x, y, z]
+        att_q_ << msg->q[0], msg->q[1], msg->q[2], msg->q[3];
+    }
+
+    void airspeed_cb(const px4_msgs::msg::AirspeedValidated::SharedPtr msg)
+    {
+        if (msg->true_airspeed_m_s > AIRSPEED_MIN) {
+            airspeed_ = msg->true_airspeed_m_s;
+        }
+        // else: keep previous valid value — sensor dropout guard
+    }
+
+    void ack_cb(const px4_msgs::msg::VehicleCommandAck::SharedPtr msg)
+    {
+        if (msg->command == px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE) {
+            if (msg->result == px4_msgs::msg::VehicleCommandAck::VEHICLE_CMD_RESULT_ACCEPTED) {
+                RCLCPP_INFO_ONCE(this->get_logger(), "[APN-FW] OFFBOARD accepted by PX4.");
+            } else {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "[APN-FW] OFFBOARD rejected — result=%d", msg->result);
+            }
+        }
+    }
+
+    void local_pos_cb(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg)
+    {
+        if ((msg->xy_global || msg->ref_timestamp > 0) && !has_ref_) {
+            has_ref_ = true;
+            ref_lat_ = msg->ref_lat;
+            ref_lon_ = msg->ref_lon;
+            ref_alt_ = msg->ref_alt;
+            RCLCPP_INFO(this->get_logger(),
+                "[APN-FW] GPS origin latched → Lat=%.6f  Lon=%.6f  Alt=%.2fm",
+                ref_lat_, ref_lon_, ref_alt_);
+        }
+        drone_pos_ned_ << msg->x,  msg->y,  msg->z;
+        drone_vel_ned_ << msg->vx, msg->vy, msg->vz;
+    }
+
+    void target_cb(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
+    {
+        if (!has_ref_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "[APN-FW] GPS origin not ready — ignoring strike point.");
+            return;
+        }
+
+        const Eigen::Vector3d p_new = gps_to_ned(msg->latitude, msg->longitude, msg->altitude);
+
+        // ── Target kinematic estimator (mirrors firmware FD + LPF) ─────────
+        if (target_initialized_) {
+            // 1st derivative — position → velocity
+            const Eigen::Vector3d raw_vel = (p_new - target_pos_prev_) / DT;
+            target_vel_ned_ = lpf3(ALPHA_TGT_VEL, raw_vel, target_vel_ned_);
+
+            // 2nd derivative — velocity → acceleration
+            const Eigen::Vector3d raw_acc = (target_vel_ned_ - target_vel_prev_) / DT;
+            target_accel_ned_ = lpf3(ALPHA_TGT_ACCEL, raw_acc, target_accel_ned_);
+
+            target_vel_prev_ = target_vel_ned_;
+        } else {
+            // First sample: seed history, zero estimates
+            target_vel_ned_   = Eigen::Vector3d::Zero();
+            target_accel_ned_ = Eigen::Vector3d::Zero();
+            target_vel_prev_  = Eigen::Vector3d::Zero();
+            target_initialized_ = true;
+        }
+
+        target_pos_prev_ = p_new;
+        target_pos_ned_  = p_new;
+
+        if (!has_target_) {
+            has_target_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                "[APN-FW] Strike point acquired → NED [N=%.2f, E=%.2f, D=%.2f]m",
+                target_pos_ned_.x(), target_pos_ned_.y(), target_pos_ned_.z());
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  APN Guidance — NED acceleration command
+    //  (Steps 1–8 from firmware reference, in Eigen)
+    // ═════════════════════════════════════════════════════════════════════════
+    Eigen::Vector3d compute_apn_accel_ned() const
+    {
+        // ── Step 3: LOS vector ────────────────────────────────────────────
+        const Eigen::Vector3d R_vec  = target_pos_ned_ - drone_pos_ned_;
+        double                R_mag  = R_vec.norm();
+        if (R_mag < 0.1) R_mag = 0.1;
+
+        const Eigen::Vector3d lambda_hat = R_vec / R_mag;
+
+        // ── Step 5: Relative kinematics ───────────────────────────────────
+        // V_rel = v_target − v_drone  (NOT just −v_drone as in original firmware)
+        const Eigen::Vector3d V_rel = target_vel_ned_ - drone_vel_ned_;
+
+        // Closing speed — signed.  Negative = diverging.
+        const double Vc = -(V_rel.dot(lambda_hat));
+
+        // LOS angular rate: Ω = (R × V_rel) / R²
+        const Eigen::Vector3d Omega = R_vec.cross(V_rel) / (R_mag * R_mag);
+
+        // ── Step 6: True PN term (TPN) ────────────────────────────────────
+        // Pure PN (using λ̂) fails when heading error is 90° because the generated
+        // acceleration is purely longitudinal to the airframe, producing zero roll!
+        // True PN uses the velocity vector (v_hat), guaranteeing the command
+        // is always perfectly lateral to the aircraft's current flight path.
+        double V_mag = drone_vel_ned_.norm();
+        if (V_mag < 1.0) V_mag = 1.0;
+        const Eigen::Vector3d v_hat = drone_vel_ned_ / V_mag;
+        const Eigen::Vector3d a_PN = Omega.cross(v_hat) * (APN_N * V_mag);
+
+        // ── Step 7: Augmented term ────────────────────────────────────────
+        // Strip LOS-parallel component — only perpendicular accel causes miss distance.
+        const Eigen::Vector3d a_tgt_perp =
+            target_accel_ned_ - target_accel_ned_.dot(lambda_hat) * lambda_hat;
+        const Eigen::Vector3d a_aug = a_tgt_perp * (APN_N / 2.0);
+
+        // ── Step 8: Combine + saturate ─────────────────────────────────────
+        Eigen::Vector3d a_cmd = a_PN + a_aug;
+        if (a_cmd.norm() > MAX_LAT_ACCEL) {
+            a_cmd = a_cmd.normalized() * MAX_LAT_ACCEL;
+        }
+
+        return a_cmd;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Fixed-Wing Attitude Command  (split-channel guidance)
+    //
+    //  ROLL  ← horizontal PN only (N-E plane of a_cmd)
+    //           Zeros out a_cmd.z before projecting to body-y so the vertical
+    //           acceleration cannot inflate g_eff and shrink the roll command.
+    //           Uses constant G denominator for predictable scaling.
+    //
+    //  PITCH ← LOS elevation angle tracking (NOT from a_cmd.z)
+    //           Drives flight-path-angle (FPA) toward the LOS depression angle.
+    //           For a ground target, los_el > 0 in NED → commands nose-down.
+    //           a_cmd.z is discarded here: for a stationary ground target the
+    //           vertical LOS rate ≈ 0, so a_cmd.z carries no dive information
+    //           and only distorts pitch via the airspeed division.
+    // ═════════════════════════════════════════════════════════════════════════
+    struct AttitudeCmd { double roll, pitch, yaw; };
+
+    AttitudeCmd accel_ned_to_attitude(const Eigen::Vector3d& a_cmd) const
+    {
+        const Eigen::Vector3d R_vec = target_pos_ned_ - drone_pos_ned_;
+
+        // ── ROLL: horizontal PN → body-lateral ───────────────────────────
+        // Zero vertical component before rotation so a_cmd.z cannot appear
+        // in the denominator via g_eff and make roll vanishingly small.
+        const Eigen::Vector3d    a_horiz{a_cmd(0), a_cmd(1), 0.0};
+        const Eigen::Quaterniond q(att_q_(0), att_q_(1), att_q_(2), att_q_(3));
+        const Eigen::Matrix3d    R_body_from_ned =
+            q.normalized().toRotationMatrix().transpose();
+        const Eigen::Vector3d    a_body_horiz = R_body_from_ned * a_horiz;
+
+        // Constant G denominator — predictable, not inflated by vertical demand
+        const double roll = std::clamp(
+            std::atan2(a_body_horiz(1), G),
+            -MAX_ROLL_RAD, MAX_ROLL_RAD);
+
+        // ── PITCH: LOS elevation tracking ─────────────────────────────────
+        // los_el: positive in NED = target is BELOW drone = want to pitch down
+        // fpa:    positive in NED = aircraft is DESCENDING = already diving
+        // Control law: pitch_cmd = −Kp·(los_el − fpa)
+        //   los_el > fpa (need more dive)   → pitch_cmd < 0  (nose down) ✓
+        //   fpa > los_el (diving too steep) → pitch_cmd > 0  (pull up)   ✓
+        const double R_horiz_mag = std::max(
+            std::sqrt(R_vec(0)*R_vec(0) + R_vec(1)*R_vec(1)), 0.1);
+        const double los_el = std::atan2(R_vec(2), R_horiz_mag);
+
+        const double v_horiz = std::max(
+            std::sqrt(drone_vel_ned_(0)*drone_vel_ned_(0) +
+                      drone_vel_ned_(1)*drone_vel_ned_(1)), 1.0);
+        const double fpa = std::atan2(drone_vel_ned_(2), v_horiz);
+
+        static constexpr double KP_PITCH = 1.5;
+        const double pitch = std::clamp(
+            -KP_PITCH * (los_el - fpa),
+            -MAX_PITCH_RAD, MAX_PITCH_RAD);
+
+        // ── YAW: nose toward target ────────────────────────────────────────
+        const double yaw = std::atan2(R_vec(1), R_vec(0));
+
+        return {roll, pitch, yaw};
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  50 Hz Timer
+    // ═════════════════════════════════════════════════════════════════════════
+    void timer_cb()
+    {
+        if (!has_target_) return;
+
+        const uint64_t ts = this->get_clock()->now().nanoseconds() / 1000;
+
+        // ── Offboard control mode heartbeat — must be ATTITUDE for fixed-wing
+        auto ocm         = px4_msgs::msg::OffboardControlMode();
+        ocm.timestamp    = ts;
+        ocm.position     = false;
+        ocm.velocity     = false;
+        ocm.acceleration = false;
+        ocm.attitude     = true;   // ← Fixed-wing uses attitude layer
+        ocm.body_rate    = false;
+        ocm_pub_->publish(ocm);
+
+        // ── Offboard mode management ───────────────────────────────────────
+        manage_offboard_mode();
+
+        // ── Only run guidance when OFFBOARD is active ──────────────────────
+        const bool is_offboard =
+            (nav_state_ == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
+        if (!is_offboard) return;
+
+        // ── Geometry ──────────────────────────────────────────────────────
+        const Eigen::Vector3d R_vec = target_pos_ned_ - drone_pos_ned_;
+        const double          R_mag = R_vec.norm();
+
+        // ── Terminal condition ─────────────────────────────────────────────
+        if (R_mag < HIT_RADIUS) {
+            handle_terminal(ts);
+            return;
+        }
+
+        // ── Guidance: NED acceleration → attitude setpoint ────────────────
+        const Eigen::Vector3d a_cmd = compute_apn_accel_ned();
+        const AttitudeCmd     att   = accel_ned_to_attitude(a_cmd);
+
+        publish_attitude_setpoint(att.roll, att.pitch, att.yaw, APN_THRUST, ts);
+
+        // ── Diagnostics ───────────────────────────────────────────────────
+        log_diagnostics(R_vec, R_mag, a_cmd, att);
+    }
+
+    // ── Terminal: pull up and cut thrust ──────────────────────────────────────
+    void handle_terminal(uint64_t ts)
+    {
+        const Eigen::Vector3d R_vec = target_pos_ned_ - drone_pos_ned_;
+        publish_attitude_setpoint(0.0, -MAX_PITCH_RAD,
+                                  std::atan2(R_vec(1), R_vec(0)),
+                                  0.0, ts);
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "[APN-FW] ★ TARGET HIT — pull-up + thrust cut.");
+    }
+
+    // ── Pack and publish VehicleAttitudeSetpoint ──────────────────────────────
+    void publish_attitude_setpoint(double roll, double pitch, double yaw,
+                                   double thrust, uint64_t ts)
+    {
+        // Convert Euler angles to quaternion
+        const Eigen::Quaterniond q =
+            Eigen::AngleAxisd(yaw,   Eigen::Vector3d::UnitZ()) *
+            Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
+            Eigen::AngleAxisd(roll,  Eigen::Vector3d::UnitX());
+
+        auto sp = px4_msgs::msg::VehicleAttitudeSetpoint();
+        sp.timestamp          = ts;
+        sp.q_d[0]             = static_cast<float>(q.w());
+        sp.q_d[1]             = static_cast<float>(q.x());
+        sp.q_d[2]             = static_cast<float>(q.y());
+        sp.q_d[3]             = static_cast<float>(q.z());
+        sp.thrust_body[0]     = static_cast<float>(thrust);  // forward thrust
+        sp.thrust_body[1]     = 0.0f;
+        sp.thrust_body[2]     = 0.0f;
+        sp.yaw_sp_move_rate   = 0.0f;
+
+        att_sp_pub_->publish(sp);
+    }
+
+    // ── OFFBOARD mode management ──────────────────────────────────────────────
+    void manage_offboard_mode()
+    {
+        if (setpoint_counter_ < PRIME_COUNT) {
+            ++setpoint_counter_;
+            return;
+        }
+
+        const bool is_offboard =
+            (nav_state_ == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
+
+        if (!is_offboard) {
+            const int ticks = setpoint_counter_ - PRIME_COUNT;
+            if (ticks % RETRY_INTERVAL == 0) {
+                publish_vehicle_command(
+                    px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE,
+                    1.0f, 6.0f);
+                RCLCPP_INFO(this->get_logger(),
+                    "[APN-FW] Requesting OFFBOARD mode (nav_state=%d)...", nav_state_);
+            }
+        }
+
+        ++setpoint_counter_;
+    }
+
+    void publish_vehicle_command(uint16_t command,
+                                 float param1 = 0.f, float param2 = 0.f)
+    {
+        auto msg             = px4_msgs::msg::VehicleCommand();
+        msg.timestamp        = this->get_clock()->now().nanoseconds() / 1000;
+        msg.command          = command;
+        msg.param1           = param1;
+        msg.param2           = param2;
+        msg.target_system    = 1;
+        msg.target_component = 1;
+        msg.source_system    = 1;
+        msg.source_component = 1;
+        msg.from_external    = true;
+        cmd_pub_->publish(msg);
+    }
+
+    // ── Diagnostics ──────────────────────────────────────────────────────────
+    void log_diagnostics(const Eigen::Vector3d& R_vec, double R_mag,
+                         const Eigen::Vector3d& a_cmd, const AttitudeCmd& att)
+    {
+        const Eigen::Vector3d lambda_hat = R_vec / R_mag;
+        const Eigen::Vector3d V_rel      = target_vel_ned_ - drone_vel_ned_;
+        const double          Vc         = -(V_rel.dot(lambda_hat));
+        const double          Vtan       = (V_rel - lambda_hat * V_rel.dot(lambda_hat)).norm();
+
+        const double R_horiz_mag = std::max(
+            std::sqrt(R_vec(0)*R_vec(0) + R_vec(1)*R_vec(1)), 0.1);
+        const double los_el_deg  = std::atan2(R_vec(2), R_horiz_mag) * 180.0 / M_PI;
+        const double v_horiz     = std::max(std::sqrt(
+            drone_vel_ned_(0)*drone_vel_ned_(0) +
+            drone_vel_ned_(1)*drone_vel_ned_(1)), 1.0);
+        const double fpa_deg     = std::atan2(drone_vel_ned_(2), v_horiz) * 180.0 / M_PI;
+
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "[APN-FW] r=%.1fm | Vc=%.1f Vtan=%.1f m/s | "
+            "LOS_el=%.1f° FPA=%.1f° | roll=%.1f° pitch=%.1f° | IAS=%.1fm/s",
+            R_mag, Vc, Vtan,
+            los_el_deg, fpa_deg,
+            att.roll  * 180.0 / M_PI,
+            att.pitch * 180.0 / M_PI,
+            airspeed_);
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Entry point
+// ═══════════════════════════════════════════════════════════════════════════
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<APNFixedWingStrikerNode>());
+    rclcpp::shutdown();
+    return 0;
+}
