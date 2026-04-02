@@ -1,0 +1,15 @@
+# ── Goal ──────────────────────────────────────────────────────────────────
+float64 latitude
+float64 longitude
+float64 altitude
+string  final_mode          # "hold" | "rtl"
+float64 arrival_radius_m    # metres — 0 → use default (10 m)
+---
+# ── Result ────────────────────────────────────────────────────────────────
+bool   arrived
+string termination          # "arrived" | "aborted" | "preempted" | "cancelled"
+---
+# ── Feedback (2 Hz) ───────────────────────────────────────────────────────
+float32 dist_m
+float32 dist_horiz_m
+float32 alt_err_m

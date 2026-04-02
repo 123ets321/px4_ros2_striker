@@ -1,0 +1,20 @@
+# ── Goal ──────────────────────────────────────────────────────────────────
+float64 latitude
+float64 longitude
+float64 altitude
+---
+# ── Result ────────────────────────────────────────────────────────────────
+bool    hit               # true  = proximity fuse triggered
+float32 miss_distance_m   # range at terminal trigger
+string  termination       # "hit" | "aborted" | "preempted" | "cancelled"
+---
+# ── Feedback (1 Hz) ───────────────────────────────────────────────────────
+float32 range_m
+float32 vc_ms
+float32 vtan_ms
+float32 los_el_deg
+float32 fpa_deg
+float32 roll_deg
+float32 pitch_deg
+float32 ias_ms
+float32 t_go_s

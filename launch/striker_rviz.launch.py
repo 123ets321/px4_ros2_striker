@@ -6,8 +6,8 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='px4_ros2_striker',
-            executable='striker_node',
-            name='striker_node',
+            executable='striker_action_server',
+            name='striker_action_server',
             output='screen',
             emulate_tty=True
         ),
