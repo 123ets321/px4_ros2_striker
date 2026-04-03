@@ -60,13 +60,13 @@ The node is completely robust and re-triggerable over the lifecycle of the entir
 
 ---
 
-## 💻 Installation & Usage
-
 ### 1. Requirements
 *   **ROS 2 Humble / Iron / Jazzy**
 *   **PX4 Autopilot (v1.14+)**
+*   **[px4-ros2-interface-lib](https://github.com/Auterion/px4-ros2-interface-lib) (release/1.16 branch)** — This package explicitly requires the `px4_ros2_cpp` component from the library to build the external modes.
 
 ### 2. Build Instructions
+Ensure both this package and `px4-ros2-interface-lib` are in your workspace `src` folder.
 ```bash
 cd ~/ETS/ws_shadow_m
 colcon build --packages-select px4_ros2_striker
@@ -74,26 +74,21 @@ source install/setup.bash
 ```
 
 ### 3. Execution
-Launch the entire striking suite (including the 3D trajectory visualization):
+Launch the control interface standalone:
 ```bash
-ros2 launch px4_ros2_striker striker_rviz.launch.py
+ros2 run px4_ros2_striker striker_ci
 ```
-*(Optionally, you can run just the bare action server: `ros2 run px4_ros2_striker striker_action_server`)*
+*(Note: If you have a visualization launch file, you can also launch it via `ros2 launch px4_ros2_striker striker_rviz.launch.py`)*
 
 ### 4. Sending Commands (GCS Simulation)
 
-To trigger a kinetic strike dive (and stream feedback telemetry):
-```bash
-ros2 action send_goal --feedback /strike_action px4_ros2_striker/action/Strike "{latitude: 47.398, longitude: 8.545, altitude: 0.0}"
-```
+This package now includes a dedicated python testing script `send_actions.py` installed globally by `CMakeLists.txt`, making it easy to trigger missions without raw ROS 2 CLI commands.
 
-To abort a dive and command geometric recovery (at 50m altitude with a 10m arrival radius):
+**To trigger the full test sequence (Strike \u2192 Abort \u2192 Recovery):**
 ```bash
-```bash
-ros2 action send_goal --feedback /recover_action px4_ros2_striker/action/Recover "{latitude: 47.397, longitude: 8.546, altitude: 50.0, final_mode: 'hold', arrival_radius_m: 10.0}"
+ros2 run px4_ros2_striker send_actions.py
 ```
-
----
+This script will automatically prime the offboard state, send a strike goal, wait for the drone to dive, and then intentionally abort the dive to trigger the Fixed-Wing Recovery Mode (which pulls up, circles the home location at 150m radius, and automatically switches to HOLD/RTL).-
 
 ## 🛑 Flight Constraints & Safety Margins
 
